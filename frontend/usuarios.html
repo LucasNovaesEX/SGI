@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Usuários — Força-tarefa COINF</title>
+  <style>
+    :root {
+      --primaria: #034991;
+      --texto: #14202E;
+      --texto-suave: #556372;
+      --borda: #D7DEE7;
+    }
+    * { box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      padding: 24px 16px;
+      color: var(--texto);
+      background: linear-gradient(135deg, #F4F7FD 0%, #E6EEFB 100%);
+    }
+    .container { max-width: 860px; margin: 0 auto; }
+    .topo {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 20px;
+    }
+    h1 { margin: 0; font-size: 22px; color: #0B2A66; }
+    .btn {
+      padding: 10px 16px;
+      border-radius: 10px;
+      border: 1px solid var(--borda);
+      background: #fff;
+      color: var(--texto);
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      text-decoration: none;
+    }
+    .btn.primaria { background: var(--primaria); color: #fff; border-color: var(--primaria); }
+    .btn.perigo { color: #B91C1C; border-color: #FECACA; background: #FEF2F2; padding: 6px 10px; font-size: 12px; }
+    .btn.sec { padding: 6px 10px; font-size: 12px; }
+    .card {
+      background: rgba(255, 255, 255, 0.85);
+      border: 1px solid #fff;
+      border-radius: 16px;
+      padding: 20px;
+      margin-bottom: 20px;
+      box-shadow: 0 10px 30px rgba(11, 42, 102, 0.06);
+    }
+    .card h2 { margin: 0 0 14px 0; font-size: 16px; color: #0B2A66; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 12px;
+      align-items: end;
+    }
+    label { display: block; font-size: 12px; font-weight: 600; margin-bottom: 4px; color: var(--texto-suave); }
+    input, select {
+      width: 100%;
+      padding: 10px 12px;
+      border: 1px solid var(--borda);
+      border-radius: 8px;
+      font-size: 14px;
+      background: #fff;
+    }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th, td { text-align: left; padding: 12px 10px; border-bottom: 1px solid #E5EBF2; }
+    th { font-size: 12px; color: var(--texto-suave); text-transform: uppercase; }
+    .tag {
+      display: inline-block;
+      padding: 3px 8px;
+      border-radius: 6px;
+      font-size: 12px;
+      font-weight: 600;
+    }
+    .tag.coord { background: #E6EEF7; color: #034991; }
+    .tag.fiscal { background: #ECFDF5; color: #047857; }
+    .tag.leitura { background: #F3F4F6; color: #4B5563; }
+    .acoes { display: flex; gap: 6px; flex-wrap: wrap; }
+    .aviso { font-size: 13px; margin-top: 10px; color: #047857; font-weight: 600; }
+    .aviso.erro { color: #B91C1C; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="topo">
+      <h1>Gerenciar Usuários da Força-tarefa</h1>
+      <a href="/" class="btn">← Voltar ao Sistema</a>
+    </div>
+
+    <div class="card">
+      <h2>Cadastrar Novo Acesso</h2>
+      <form id="form-novo" class="grid">
+        <div>
+          <label>Nome completo</label>
+          <input id="novo-nome" type="text" placeholder="Ex.: João Pereira" required>
+        </div>
+        <div>
+          <label>E-mail de acesso</label>
+          <input id="novo-email" type="email" placeholder="joao@empresa.com.br" required>
+        </div>
+        <div>
+          <label>Senha inicial</label>
+          <input id="novo-senha" type="text" placeholder="Mínimo 4 caracteres" required minlength="4">
+        </div>
+        <div>
+          <label>Nível de permissão</label>
+          <select id="novo-perfil">
+            <option value="fiscal">Fiscal (preenche vistorias)</option>
+            <option value="coordenador">Coordenação (acesso total)</option>
+            <option value="leitura">Somente leitura (visualiza)</option>
+          </select>
+        </div>
+        <div>
+          <button type="submit" class="btn primaria" style="width:100%">Criar Usuário</button>
+        </div>
+      </form>
+      <div id="feedback" class="aviso"></div>
+    </div>
+
+    <div class="card">
+      <h2>Usuários Cadastrados</h2>
+      <div style="overflow-x:auto;">
+        <table>
+          <thead>
+            <tr>
+              <th>Nome</th>
+              <th>E-mail</th>
+              <th>Permissão</th>
+              <th>Ações</th>
+            </tr>
+          </thead>
+          <tbody id="lista-usuarios"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const feedback = document.getElementById('feedback');
+
+    function mostrarAviso(texto, erro = false) {
+      feedback.textContent = texto;
+      feedback.className = erro ? 'aviso erro' : 'aviso';
+    }
+
+    async function carregarUsuarios() {
+      const resp = await fetch('/api/admin/usuarios');
+      if (!resp.ok) {
+        window.location.href = '/';
+        return;
+      }
+      const dados = await resp.json();
+      const tbody = document.getElementById('lista-usuarios');
+      tbody.innerHTML = '';
+
+      for (const u of dados.usuarios) {
+        const tr = document.createElement('tr');
+        let tagHtml = '<span class="tag leitura">Somente leitura</span>';
+        if (u.is_owner) tagHtml = '<span class="tag coord">Coordenação</span>';
+        else if (u.pode_escrever) tagHtml = '<span class="tag fiscal">Fiscal</span>';
+
+        tr.innerHTML = `
+          <td><strong>${u.nome}</strong></td>
+          <td>${u.email}</td>
+          <td>${tagHtml}</td>
+          <td class="acoes">
+            <button class="btn sec" onclick="redefinirSenha('${u.id}', '${u.nome}')">Trocar senha</button>
+            <button class="btn perigo" onclick="excluirUsuario('${u.id}', '${u.nome}')">Excluir</button>
+          </td>
+        `;
+        tbody.appendChild(tr);
+      }
+    }
+
+    document.getElementById('form-novo').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const resp = await fetch('/api/admin/usuarios', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          nome: document.getElementById('novo-nome').value.trim(),
+          email: document.getElementById('novo-email').value.trim(),
+          senha: document.getElementById('novo-senha').value,
+          perfil: document.getElementById('novo-perfil').value
+        })
+      });
+      const dados = await resp.json();
+      if (!resp.ok) {
+        mostrarAviso(dados.detail || 'Erro ao cadastrar.', true);
+        return;
+      }
+      e.target.reset();
+      mostrarAviso('Usuário cadastrado com sucesso!');
+      carregarUsuarios();
+    });
+
+    async function redefinirSenha(id, nome) {
+      const nova = prompt(`Digite a nova senha para ${nome} (mínimo 4 caracteres):`);
+      if (!nova || nova.length < 4) return;
+      const resp = await fetch(`/api/admin/usuarios/${id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ senha: nova })
+      });
+      if (resp.ok) mostrarAviso(`Senha de ${nome} atualizada!`);
+    }
+
+    async function excluirUsuario(id, nome) {
+      if (!confirm(`Tem certeza que deseja remover o acesso de ${nome}?`)) return;
+      const resp = await fetch(`/api/admin/usuarios/${id}`, { method: 'DELETE' });
+      const dados = await resp.json();
+      if (!resp.ok) {
+        mostrarAviso(dados.detail || 'Não foi possível excluir.', true);
+        return;
+      }
+      mostrarAviso(`Acesso de ${nome} removido.`);
+      carregarUsuarios();
+    }
+
+    carregarUsuarios();
+  </script>
+</body>
+</html>
