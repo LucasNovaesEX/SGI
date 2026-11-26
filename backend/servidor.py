@@ -1,599 +1,868 @@
 import asyncio
 import hashlib
-import hmac
 import json
+import os
 import secrets
-import sqlite3
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Optional
 
-from fastapi import FastAPI, File, HTTPException, Request, Response, UploadFile
-from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
+import psycopg
+from psycopg.rows import dict_row
+from fastapi import Cookie, FastAPI, File, HTTPException, Request, Response, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+
+# ==============================================================================
+# CONFIGURAÇÕES DO BANCO E DIRETÓRIOS
+# ==============================================================================
+SENHA_POSTGRES = os.getenv("POSTGRES_PASSWORD", "coinf123")
+DSN = os.getenv(
+    "DATABASE_URL",
+    f"postgresql://postgres:{SENHA_POSTGRES}@localhost:5432/coinf_db",
+)
 
 PASTA_PROJETO = Path(__file__).resolve().parent.parent
 PASTA_FRONTEND = PASTA_PROJETO / "frontend"
-PASTA_FOTOS = PASTA_PROJETO / "storage" / "fotos"
-CAMINHO_BANCO = PASTA_PROJETO / "dados_coinf.db"
-
+PASTA_STORAGE = PASTA_PROJETO / "storage"
+PASTA_FOTOS = PASTA_STORAGE / "fotos"
 PASTA_FOTOS.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="Força-Tarefa Rede de Escolas - COINF")
-telas_conectadas: List[asyncio.Queue] = []
-
-COOKIE_SESSAO = "coinf_session"
-SENHA_PADRAO_INICIAL = "coinf2026"
+SESSOES: dict[str, dict] = {}
+FILAS_SSE: list[asyncio.Queue] = []
 
 
-def agora_utc() -> datetime:
-    return datetime.now(timezone.utc)
+def get_conn():
+    return psycopg.connect(DSN, row_factory=dict_row)
 
 
-def agora_iso() -> str:
-    return agora_utc().isoformat()
-
-
-def gerar_hash_senha(senha: str, salt: Optional[str] = None) -> tuple[str, str]:
-    if not salt:
-        salt = secrets.token_hex(16)
-    dk = hashlib.pbkdf2_hmac(
-        "sha256", senha.encode("utf-8"), salt.encode("utf-8"), 120_000
-    )
+def gerar_hash_senha(senha: str) -> tuple[str, str]:
+    salt = secrets.token_hex(16)
+    dk = hashlib.pbkdf2_hmac("sha256", senha.encode("utf-8"), salt.encode("utf-8"), 120_000)
     return dk.hex(), salt
 
 
-def verificar_senha(senha: str, senha_hash: Optional[str], salt: Optional[str]) -> bool:
-    if not senha_hash or not salt:
-        return False
-    calculado, _ = gerar_hash_senha(senha, salt)
-    return hmac.compare_digest(calculado, senha_hash)
+def verificar_senha(senha: str, senha_hash: str, salt: str) -> bool:
+    dk = hashlib.pbkdf2_hmac("sha256", senha.encode("utf-8"), salt.encode("utf-8"), 120_000)
+    return secrets.compare_digest(dk.hex(), senha_hash)
 
 
-def abrir_conexao() -> sqlite3.Connection:
-    conn = sqlite3.connect(CAMINHO_BANCO)
-    conn.row_factory = sqlite3.Row
-    return conn
+def registrar_historico(cur, id_usuario: Optional[int], acao: str, alvo: str = "", detalhe: str = ""):
+    cur.execute(
+        """
+        INSERT INTO historico (id_usuario, acao, alvo, detalhe)
+        VALUES (%s, %s, %s, %s)
+        """,
+        (id_usuario, acao, alvo, detalhe),
+    )
 
 
-def iniciar_banco():
-    conn = abrir_conexao()
-    cur = conn.cursor()
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS usuarios (
-            id TEXT PRIMARY KEY,
-            nome TEXT NOT NULL,
-            email TEXT UNIQUE NOT NULL,
-            is_owner INTEGER NOT NULL DEFAULT 0,
-            pode_escrever INTEGER NOT NULL DEFAULT 1,
-            senha_hash TEXT,
-            salt TEXT
-        )
-    """)
-
-    # Garante compatibilidade com o banco já criado no passo anterior
-    colunas = [r["name"] for r in cur.execute("PRAGMA table_info(usuarios)").fetchall()]
-    if "senha_hash" not in colunas:
-        cur.execute("ALTER TABLE usuarios ADD COLUMN senha_hash TEXT")
-    if "salt" not in colunas:
-        cur.execute("ALTER TABLE usuarios ADD COLUMN salt TEXT")
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS sessoes (
-            token TEXT PRIMARY KEY,
-            user_id TEXT NOT NULL,
-            criado_em TEXT NOT NULL,
-            expira_em TEXT NOT NULL
-        )
-    """)
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS registros (
-            colecao TEXT NOT NULL,
-            doc_id TEXT NOT NULL,
-            dados TEXT NOT NULL,
-            atualizado_em TEXT NOT NULL,
-            PRIMARY KEY (colecao, doc_id)
-        )
-    """)
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS historico (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            em TEXT NOT NULL,
-            por TEXT,
-            acao TEXT NOT NULL,
-            alvo TEXT,
-            detalhe TEXT
-        )
-    """)
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS arquivos (
-            id TEXT PRIMARY KEY,
-            nome_arquivo TEXT NOT NULL,
-            mime_type TEXT NOT NULL,
-            size_bytes INTEGER NOT NULL,
-            criado_em TEXT NOT NULL
-        )
-    """)
-
-    # Cria ou atualiza a senha do administrador padrão
-    senha_hash, salt = gerar_hash_senha(SENHA_PADRAO_INICIAL)
-    cur.execute("""
-        INSERT OR IGNORE INTO usuarios (id, nome, email, is_owner, pode_escrever, senha_hash, salt)
-        VALUES ('coord_coinf', 'Coordenação COINF', 'coinf@educacao.ba.gov.br', 1, 1, ?, ?)
-    """, (senha_hash, salt))
-
-    cur.execute("""
-        UPDATE usuarios
-        SET senha_hash = ?, salt = ?
-        WHERE id = 'coord_coinf' AND (senha_hash IS NULL OR senha_hash = '')
-    """, (senha_hash, salt))
-
-    conn.commit()
-    conn.close()
+# ==============================================================================
+# ESPELHAMENTO EXATO PARA AS TABELAS RELACIONAIS DO POSTGRESQL
+# ==============================================================================
+MAPA_SISTEMAS_CHAVES = {
+    "estrutura": "Estrutura",
+    "cobertura": "Cobertura",
+    "eletrica": "Instalações Elétricas",
+    "hidro": "Instalações Hidrossanitárias",
+    "esquadrias": "Esquadrias",
+    "pisos": "Pisos e Revestimentos",
+    "acess": "Acessibilidade",
+    "incendio": "Prevenção de Incêndio",
+}
 
 
-iniciar_banco()
-
-
-def obter_usuario_sessao(request: Request) -> Optional[dict]:
-    token = request.cookies.get(COOKIE_SESSAO)
-    if not token:
+def localizar_escola(cur, cod_sec: str) -> Optional[int]:
+    if not cod_sec:
         return None
-    conn = abrir_conexao()
-    row = conn.execute("""
-        SELECT u.id, u.nome, u.email, u.is_owner, u.pode_escrever, s.expira_em
-        FROM sessoes s
-        JOIN usuarios u ON u.id = s.user_id
-        WHERE s.token = ?
-    """, (token,)).fetchone()
-    conn.close()
-    if not row:
+    cur.execute("SELECT id FROM unidades_escolares WHERE cod_sec = %s LIMIT 1", (str(cod_sec).strip(),))
+    row = cur.fetchone()
+    return row["id"] if row else None
+
+
+def garantir_vistoria_escola(cur, id_unid_esc: int, id_usuario: int, data_vistoria: str) -> int:
+    cur.execute(
+        """
+        SELECT id FROM vistorias
+        WHERE id_unid_esc = %s
+        ORDER BY id DESC LIMIT 1
+        """,
+        (id_unid_esc,),
+    )
+    existente = cur.fetchone()
+    if existente:
+        return existente["id"]
+
+    cur.execute(
+        """
+        INSERT INTO vistorias (id_unid_esc, id_usuario, data_vistoria)
+        VALUES (%s, %s, %s)
+        RETURNING id
+        """,
+        (id_unid_esc, id_usuario, data_vistoria),
+    )
+    return cur.fetchone()["id"]
+
+
+def espelhar_documento_relacional(cur, colecao: str, doc_id: str, item: dict, id_usuario: int):
+    if not isinstance(item, dict):
+        return
+
+    # 1. Coleção DIAGNOSTICOS (doc_id = cod_sec da escola)
+    if colecao == "diagnosticos":
+        id_unid_esc = localizar_escola(cur, doc_id)
+        if not id_unid_esc:
+            return
+
+        data_vist = item.get("data") or datetime.now().strftime("%Y-%m-%d")
+        id_vistoria = garantir_vistoria_escola(cur, id_unid_esc, id_usuario, data_vist)
+
+        patologias = str(item.get("obs") or "")
+        if item.get("risco") and item.get("riscoDesc"):
+            patologias = f"[RISCO IMINENTE: {item['riscoDesc']}] {patologias}".strip()
+
+        recomendacoes = str(item.get("rec") or "")
+        nota_final = float(item.get("nota") or item.get("total") or 0)
+        prioridade = str(item.get("prioridade") or "")
+        fiscal = str(item.get("fiscal") or "")
+        empresa = str(item.get("empresa") or "")
+        funcionamento = str(item.get("funcionamento") or "")
+
+        cur.execute(
+            """
+            UPDATE vistorias
+            SET id_usuario = %s,
+                data_vistoria = %s,
+                fiscal_responsavel = COALESCE(NULLIF(%s, ''), fiscal_responsavel),
+                empresa_executora = COALESCE(NULLIF(%s, ''), empresa_executora),
+                em_funcionamento = COALESCE(NULLIF(%s, ''), em_funcionamento),
+                patologias_encontradas = %s,
+                recomendacoes = %s,
+                nota_final = %s,
+                prioridade = %s,
+                atualizado_em = NOW()
+            WHERE id = %s
+            """,
+            (
+                id_usuario,
+                data_vist,
+                fiscal,
+                empresa,
+                funcionamento,
+                patologias,
+                recomendacoes,
+                nota_final,
+                prioridade,
+                id_vistoria,
+            ),
+        )
+
+        gut = item.get("gut") or {}
+        if isinstance(gut, dict):
+            cur.execute("SELECT id, sistema FROM pesos_gut")
+            pesos_db = {row["sistema"]: row["id"] for row in cur.fetchall()}
+
+            for chave_sis, notas in gut.items():
+                nome_oficial = MAPA_SISTEMAS_CHAVES.get(chave_sis.lower())
+                if not nome_oficial or nome_oficial not in pesos_db or not isinstance(notas, dict):
+                    continue
+
+                g = int(notas.get("g") or 0)
+                u = int(notas.get("u") or 0)
+                t = int(notas.get("t") or 0)
+                if 1 <= g <= 10 and 1 <= u <= 10 and 1 <= t <= 10:
+                    cur.execute(
+                        """
+                        INSERT INTO vistorias_sistemas (
+                            id_vistoria, id_peso_gut, gravidade, urgencia, tendencia
+                        )
+                        VALUES (%s, %s, %s, %s, %s)
+                        ON CONFLICT (id_vistoria, id_peso_gut) DO UPDATE SET
+                            gravidade = EXCLUDED.gravidade,
+                            urgencia = EXCLUDED.urgencia,
+                            tendencia = EXCLUDED.tendencia
+                        """,
+                        (id_vistoria, pesos_db[nome_oficial], g, u, t),
+                    )
+
+    # 2. Coleção VISITAS (doc_id = cod_sec da escola)
+    elif colecao == "visitas":
+        id_unid_esc = localizar_escola(cur, doc_id)
+        if not id_unid_esc:
+            return
+
+        data_vist = item.get("fim") or item.get("inicio") or datetime.now().strftime("%Y-%m-%d")
+        id_vistoria = garantir_vistoria_escola(cur, id_unid_esc, id_usuario, data_vist)
+        fiscal = str(item.get("fiscal") or "")
+        status = str(item.get("status") or "")
+
+        cur.execute(
+            """
+            UPDATE vistorias
+            SET fiscal_responsavel = COALESCE(NULLIF(%s, ''), fiscal_responsavel),
+                status_visita = COALESCE(NULLIF(%s, ''), status_visita),
+                atualizado_em = NOW()
+            WHERE id = %s
+            """,
+            (fiscal, status, id_vistoria),
+        )
+
+    # 3. Coleção FOTOS (dados['cod'] = cod_sec, dados['asset'] = uuid do arquivo)
+    elif colecao == "fotos":
+        cod_sec = str(item.get("cod") or "").strip()
+        asset_id = str(item.get("asset") or "").strip()
+        if not cod_sec or not asset_id:
+            return
+
+        id_unid_esc = localizar_escola(cur, cod_sec)
+        if not id_unid_esc:
+            return
+
+        id_vistoria = garantir_vistoria_escola(cur, id_unid_esc, id_usuario, datetime.now().strftime("%Y-%m-%d"))
+        legenda = str(item.get("legenda") or "")
+        tamanho_bytes = int(item.get("bytes") or 0)
+
+        caminho_relativo = f"storage/fotos/{asset_id}.jpg"
+        for candidato in PASTA_FOTOS.glob(f"{asset_id}.*"):
+            caminho_relativo = f"storage/fotos/{candidato.name}"
+            break
+
+        try:
+            cur.execute(
+                """
+                INSERT INTO fotos (id, id_vistoria, caminho_arquivo, legenda, tamanho_bytes)
+                VALUES (%s::uuid, %s, %s, %s, %s)
+                ON CONFLICT (id) DO UPDATE SET
+                    id_vistoria = EXCLUDED.id_vistoria,
+                    legenda = EXCLUDED.legenda
+                """,
+                (asset_id, id_vistoria, caminho_relativo, legenda, tamanho_bytes),
+            )
+        except Exception:
+            pass
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Garante usuário admin, colunas extras em vistorias e sincroniza registros existentes."""
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # 1. Garante colunas complementares na tabela vistorias
+                cur.execute("""
+                    ALTER TABLE vistorias
+                        ADD COLUMN IF NOT EXISTS fiscal_responsavel VARCHAR(150),
+                        ADD COLUMN IF NOT EXISTS empresa_executora VARCHAR(150),
+                        ADD COLUMN IF NOT EXISTS em_funcionamento VARCHAR(30),
+                        ADD COLUMN IF NOT EXISTS status_visita VARCHAR(50);
+                """)
+
+                # 2. Garante usuário inicial da Coordenação
+                cur.execute("SELECT id FROM usuarios WHERE LOWER(email) = 'coinf@educacao.ba.gov.br'")
+                admin = cur.fetchone()
+                if not admin:
+                    senha_hash, salt = gerar_hash_senha("coinf2026")
+                    cur.execute(
+                        """
+                        INSERT INTO usuarios (nome, email, senha_hash, salt, perfil, cargo, ativo)
+                        VALUES (%s, %s, %s, %s, 'coordenacao', 'Coordenação COINF', TRUE)
+                        RETURNING id
+                        """,
+                        ("Coordenação COINF", "coinf@educacao.ba.gov.br", senha_hash, salt),
+                    )
+                    admin_id = cur.fetchone()["id"]
+                else:
+                    admin_id = admin["id"]
+
+                # 3. Sincroniza para as tabelas relacionais o que já estiver em registros_kv
+                cur.execute(
+                    """
+                    SELECT colecao, doc_id, dados, COALESCE(atualizado_por, %s) AS uid
+                    FROM registros_kv
+                    WHERE colecao IN ('diagnosticos', 'visitas', 'fotos')
+                    ORDER BY atualizado_em ASC
+                    """,
+                    (admin_id,),
+                )
+                for reg in cur.fetchall():
+                    espelhar_documento_relacional(cur, reg["colecao"], reg["doc_id"], reg["dados"], reg["uid"])
+
+            conn.commit()
+    except Exception as exc:
+        print(f"⚠️ Aviso na inicialização do PostgreSQL: {exc}")
+    yield
+
+
+app = FastAPI(title="Força-Tarefa Rede de Escolas - COINF (PostgreSQL)", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+async def notificar_sse(colecao: str):
+    payload = json.dumps({"colecao": colecao})
+    for fila in list(FILAS_SSE):
+        try:
+            fila.put_nowait(payload)
+        except Exception:
+            pass
+
+
+def obter_usuario_sessao(session_token: Optional[str]) -> Optional[dict]:
+    if not session_token:
         return None
-    if row["expira_em"] <= agora_iso():
+    sessao = SESSOES.get(session_token)
+    if not sessao:
         return None
-    return dict(row)
+    if sessao["expira_em"] < datetime.now(timezone.utc):
+        SESSOES.pop(session_token, None)
+        return None
+    return sessao
 
 
-def exigir_usuario(request: Request) -> dict:
-    usuario = obter_usuario_sessao(request)
-    if not usuario:
-        raise HTTPException(status_code=401, detail="Faça login para continuar.")
-    return usuario
-
-
-def exigir_coordenador(request: Request) -> dict:
-    usuario = exigir_usuario(request)
-    if not usuario["is_owner"]:
+def exigir_usuario(session_token: Optional[str], exigir_escrita: bool = False, exigir_admin: bool = False) -> dict:
+    user = obter_usuario_sessao(session_token)
+    if not user:
+        raise HTTPException(status_code=401, detail="Não autenticado.")
+    if exigir_admin and not user["isOwner"]:
         raise HTTPException(status_code=403, detail="Acesso restrito à Coordenação.")
-    return usuario
-
-
-async def avisar_telas(colecao: str):
-    mensagem = json.dumps({"colecao": colecao})
-    for fila in list(telas_conectadas):
-        await fila.put(mensagem)
+    if exigir_escrita and not user["canWrite"]:
+        raise HTTPException(status_code=403, detail="Perfil somente leitura.")
+    return user
 
 
 # ==============================================================================
-# ROTAS DE LOGIN, LOGOUT E GERENCIAMENTO DE USUÁRIOS
+# ROTAS DE AUTENTICAÇÃO (/api/login, /api/logout, /api/me)
 # ==============================================================================
+class LoginInput(BaseModel):
+    email: str
+    senha: str
+
 
 @app.post("/api/login")
-async def login(request: Request, response: Response):
-    corpo = await request.json()
-    email = (corpo.get("email") or "").strip().lower()
-    senha = corpo.get("senha") or ""
+def login(body: LoginInput, response: Response):
+    email_limpo = body.email.strip().lower()
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, nome, email, senha_hash, salt, perfil, cargo, ativo
+                FROM usuarios
+                WHERE LOWER(email) = %s
+                """,
+                (email_limpo,),
+            )
+            user = cur.fetchone()
 
-    conn = abrir_conexao()
-    user = conn.execute(
-        "SELECT * FROM usuarios WHERE lower(email) = ?", (email,)
-    ).fetchone()
+            if not user or not user["ativo"] or not verificar_senha(body.senha, user["senha_hash"], user["salt"]):
+                raise HTTPException(status_code=401, detail="E-mail ou senha inválidos.")
 
-    if not user or not verificar_senha(senha, user["senha_hash"], user["salt"]):
-        conn.close()
-        raise HTTPException(status_code=401, detail="E-mail ou senha incorretos.")
+            token = secrets.token_urlsafe(32)
+            is_owner = user["perfil"] == "coordenacao"
+            can_write = user["perfil"] in ("coordenacao", "fiscal", "administrativo")
 
-    token = secrets.token_urlsafe(32)
-    expira = (agora_utc() + timedelta(days=30)).isoformat()
-    conn.execute(
-        "INSERT INTO sessoes (token, user_id, criado_em, expira_em) VALUES (?, ?, ?, ?)",
-        (token, user["id"], agora_iso(), expira),
-    )
-    conn.commit()
-    conn.close()
+            sessao = {
+                "id": user["id"],
+                "uid": str(user["id"]),
+                "nome": user["nome"],
+                "email": user["email"],
+                "perfil": user["perfil"],
+                "cargo": user["cargo"] or "",
+                "isOwner": is_owner,
+                "canWrite": can_write,
+                "expira_em": datetime.now(timezone.utc) + timedelta(hours=12),
+            }
+            SESSOES[token] = sessao
+            registrar_historico(cur, user["id"], "LOGIN", user["email"], "Login efetuado no sistema")
+        conn.commit()
 
     response.set_cookie(
-        key=COOKIE_SESSAO,
+        key="session_token",
         value=token,
         httponly=True,
         samesite="lax",
-        max_age=30 * 24 * 3600,
         path="/",
+        max_age=12 * 3600,
     )
-    return {"ok": True}
+    return {"ok": True, "usuario": {k: v for k, v in sessao.items() if k != "expira_em"}}
 
 
 @app.post("/api/logout")
-def logout(request: Request, response: Response):
-    token = request.cookies.get(COOKIE_SESSAO)
-    if token:
-        conn = abrir_conexao()
-        conn.execute("DELETE FROM sessoes WHERE token = ?", (token,))
-        conn.commit()
-        conn.close()
-    response.delete_cookie(key=COOKIE_SESSAO, path="/")
+def logout(response: Response, session_token: Optional[str] = Cookie(default=None)):
+    if session_token:
+        SESSOES.pop(session_token, None)
+    response.delete_cookie("session_token", path="/")
     return {"ok": True}
 
 
 @app.get("/api/me")
-def usuario_atual(request: Request):
-    u = exigir_usuario(request)
-    return {
-        "uid": u["id"],
-        "nome": u["nome"],
-        "email": u["email"],
-        "isOwner": bool(u["is_owner"]),
-        "canWrite": bool(u["pode_escrever"]),
-    }
+def me(session_token: Optional[str] = Cookie(default=None)):
+    user = exigir_usuario(session_token)
+    return {k: v for k, v in user.items() if k != "expira_em"}
 
 
 @app.post("/api/users/profiles")
-async def perfis_usuarios(request: Request):
-    exigir_usuario(request)
-    corpo = await request.json()
-    ids = corpo.get("ids", [])
-    if not ids:
-        return {}
-    conn = abrir_conexao()
-    marcadores = ",".join("?" for _ in ids)
-    rows = conn.execute(
-        f"SELECT id, nome, email FROM usuarios WHERE id IN ({marcadores})", ids
-    ).fetchall()
-    conn.close()
-    return {r["id"]: {"name": r["nome"], "email": r["email"]} for r in rows}
+async def users_profiles(request: Request, session_token: Optional[str] = Cookie(default=None)):
+    exigir_usuario(session_token)
+    body = await request.json()
+    ids = body.get("ids") or []
+    perfis = {}
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, nome, email, cargo, perfil FROM usuarios")
+            for r in cur.fetchall():
+                uid = str(r["id"])
+                if not ids or uid in [str(x) for x in ids]:
+                    perfis[uid] = {
+                        "id": uid,
+                        "name": r["nome"],
+                        "nome": r["nome"],
+                        "email": r["email"],
+                        "cargo": r["cargo"] or "",
+                        "perfil": r["perfil"],
+                    }
+    return perfis
 
 
+# ==============================================================================
+# ADMINISTRAÇÃO DE USUÁRIOS (/api/admin/usuarios)
+# ==============================================================================
 @app.get("/api/admin/usuarios")
-def listar_usuarios_admin(request: Request):
-    exigir_coordenador(request)
-    conn = abrir_conexao()
-    rows = conn.execute(
-        "SELECT id, nome, email, is_owner, pode_escrever FROM usuarios ORDER BY is_owner DESC, nome ASC"
-    ).fetchall()
-    conn.close()
-    return {"usuarios": [dict(r) for r in rows]}
+def admin_listar_usuarios(session_token: Optional[str] = Cookie(default=None)):
+    exigir_usuario(session_token, exigir_admin=True)
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, nome, email, perfil, cargo, telefone, contratante, ativo, criado_em
+                FROM usuarios
+                ORDER BY nome
+                """
+            )
+            lista = cur.fetchall()
+            for u in lista:
+                u["papel"] = {
+                    "coordenacao": "admin",
+                    "fiscal": "editor",
+                    "administrativo": "editor",
+                    "leitura": "leitor",
+                }.get(u["perfil"], "editor")
+                if u.get("criado_em"):
+                    u["criado_em"] = u["criado_em"].isoformat()
+    return {"usuarios": lista}
 
 
 @app.post("/api/admin/usuarios")
-async def criar_usuario_admin(request: Request):
-    exigir_coordenador(request)
-    corpo = await request.json()
-    nome = (corpo.get("nome") or "").strip()
-    email = (corpo.get("email") or "").strip().lower()
-    senha = corpo.get("senha") or ""
-    perfil = corpo.get("perfil") or "fiscal"
+async def admin_criar_usuario(request: Request, session_token: Optional[str] = Cookie(default=None)):
+    admin = exigir_usuario(session_token, exigir_admin=True)
+    body = await request.json()
+    nome = (body.get("nome") or "").strip()
+    email = (body.get("email") or "").strip().lower()
+    senha = body.get("senha") or ""
+    papel = (body.get("papel") or body.get("perfil") or "fiscal").lower()
+    cargo = body.get("cargo") or ""
+    telefone = body.get("telefone") or ""
 
-    if not nome or not email or len(senha) < 4:
-        raise HTTPException(status_code=400, detail="Preencha nome, e-mail e senha (mínimo 4 caracteres).")
+    if not nome or not email or not senha:
+        raise HTTPException(status_code=400, detail="Nome, e-mail e senha são obrigatórios.")
 
-    is_owner = 1 if perfil == "coordenador" else 0
-    pode_escrever = 0 if perfil == "leitura" else 1
+    perfil_db = {
+        "admin": "coordenacao",
+        "coordenacao": "coordenacao",
+        "editor": "fiscal",
+        "fiscal": "fiscal",
+        "administrativo": "administrativo",
+        "leitor": "leitura",
+        "leitura": "leitura",
+    }.get(papel, "fiscal")
+
     senha_hash, salt = gerar_hash_senha(senha)
-    novo_id = f"usr_{uuid.uuid4().hex[:10]}"
 
-    conn = abrir_conexao()
-    try:
-        conn.execute(
-            """
-            INSERT INTO usuarios (id, nome, email, is_owner, pode_escrever, senha_hash, salt)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (novo_id, nome, email, is_owner, pode_escrever, senha_hash, salt),
-        )
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO usuarios (nome, email, senha_hash, salt, perfil, cargo, telefone)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id
+                    """,
+                    (nome, email, senha_hash, salt, perfil_db, cargo, telefone),
+                )
+                novo_id = cur.fetchone()["id"]
+                registrar_historico(cur, admin["id"], "CRIAR_USUARIO", email, f"Perfil: {perfil_db}")
+            except psycopg.errors.UniqueViolation:
+                raise HTTPException(status_code=400, detail="E-mail já cadastrado.")
         conn.commit()
-    except sqlite3.IntegrityError:
-        conn.close()
-        raise HTTPException(status_code=400, detail="Já existe um usuário cadastrado com esse e-mail.")
-    conn.close()
+
     return {"ok": True, "id": novo_id}
 
 
+@app.put("/api/admin/usuarios/{user_id}")
 @app.patch("/api/admin/usuarios/{user_id}")
-async def atualizar_usuario_admin(user_id: str, request: Request):
-    exigir_coordenador(request)
-    corpo = await request.json()
-    senha = corpo.get("senha")
-    if senha:
-        if len(senha) < 4:
-            raise HTTPException(status_code=400, detail="A senha deve ter pelo menos 4 caracteres.")
-        senha_hash, salt = gerar_hash_senha(senha)
-        conn = abrir_conexao()
-        conn.execute(
-            "UPDATE usuarios SET senha_hash = ?, salt = ? WHERE id = ?",
-            (senha_hash, salt, user_id),
-        )
+async def admin_editar_usuario(user_id: int, request: Request, session_token: Optional[str] = Cookie(default=None)):
+    admin = exigir_usuario(session_token, exigir_admin=True)
+    body = await request.json()
+
+    perfil_map = {
+        "admin": "coordenacao",
+        "coordenacao": "coordenacao",
+        "editor": "fiscal",
+        "fiscal": "fiscal",
+        "administrativo": "administrativo",
+        "leitor": "leitura",
+        "leitura": "leitura",
+    }
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, email FROM usuarios WHERE id = %s", (user_id,))
+            alvo = cur.fetchone()
+            if not alvo:
+                raise HTTPException(status_code=404, detail="Usuário não encontrado.")
+
+            if "nome" in body and body["nome"]:
+                cur.execute("UPDATE usuarios SET nome = %s WHERE id = %s", (body["nome"].strip(), user_id))
+            if "papel" in body or "perfil" in body:
+                p_raw = (body.get("papel") or body.get("perfil") or "fiscal").lower()
+                cur.execute("UPDATE usuarios SET perfil = %s WHERE id = %s", (perfil_map.get(p_raw, "fiscal"), user_id))
+            if "cargo" in body:
+                cur.execute("UPDATE usuarios SET cargo = %s WHERE id = %s", (body["cargo"], user_id))
+            if "telefone" in body:
+                cur.execute("UPDATE usuarios SET telefone = %s WHERE id = %s", (body["telefone"], user_id))
+            if "ativo" in body:
+                cur.execute("UPDATE usuarios SET ativo = %s WHERE id = %s", (bool(body["ativo"]), user_id))
+            if body.get("senha"):
+                senha_hash, salt = gerar_hash_senha(body["senha"])
+                cur.execute(
+                    "UPDATE usuarios SET senha_hash = %s, salt = %s WHERE id = %s",
+                    (senha_hash, salt, user_id),
+                )
+
+            registrar_historico(cur, admin["id"], "EDITAR_USUARIO", alvo["email"], "Cadastro atualizado")
         conn.commit()
-        conn.close()
+
     return {"ok": True}
 
 
 @app.delete("/api/admin/usuarios/{user_id}")
-def apagar_usuario_admin(user_id: str, request: Request):
-    atual = exigir_coordenador(request)
-    if atual["id"] == user_id:
-        raise HTTPException(status_code=400, detail="Você não pode excluir o seu próprio usuário.")
-    conn = abrir_conexao()
-    conn.execute("DELETE FROM sessoes WHERE user_id = ?", (user_id,))
-    conn.execute("DELETE FROM usuarios WHERE id = ?", (user_id,))
-    conn.commit()
-    conn.close()
+def admin_excluir_usuario(user_id: int, session_token: Optional[str] = Cookie(default=None)):
+    admin = exigir_usuario(session_token, exigir_admin=True)
+    if admin["id"] == user_id:
+        raise HTTPException(status_code=400, detail="Você não pode excluir seu próprio usuário.")
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM usuarios WHERE id = %s RETURNING email", (user_id,))
+            removido = cur.fetchone()
+            if removido:
+                registrar_historico(cur, admin["id"], "EXCLUIR_USUARIO", removido["email"], "Usuário removido")
+        conn.commit()
     return {"ok": True}
 
 
 # ==============================================================================
-# CANAL AO VIVO E ROTAS DO BANCO DE DADOS (PROTEGIDAS POR LOGIN)
+# BANCO DE DADOS COMPATÍVEL COM CLAUDE-ADAPTER.JS (/api/db/...)
 # ==============================================================================
+@app.get("/api/db/{caminho:path}")
+def db_get(caminho: str, limit: Optional[int] = None, session_token: Optional[str] = Cookie(default=None)):
+    exigir_usuario(session_token)
+    partes = [p for p in caminho.split("/") if p]
 
+    if len(partes) == 1 and partes[0] == "historico":
+        lim = limit or 100
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT h.id, h.em, h.acao, h.alvo, h.detalhe, COALESCE(u.nome, 'Sistema') AS usuario
+                    FROM historico h
+                    LEFT JOIN usuarios u ON u.id = h.id_usuario
+                    ORDER BY h.id DESC
+                    LIMIT %s
+                    """,
+                    (lim,),
+                )
+                rows = cur.fetchall()
+                for r in rows:
+                    if r.get("em"):
+                        r["em"] = r["em"].isoformat()
+        return {"docs": rows}
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            if len(partes) == 1:
+                colecao = partes[0]
+                sql = "SELECT doc_id AS id, dados AS data FROM registros_kv WHERE colecao = %s ORDER BY atualizado_em DESC"
+                params = [colecao]
+                if limit:
+                    sql += " LIMIT %s"
+                    params.append(limit)
+                cur.execute(sql, params)
+                return {"docs": cur.fetchall()}
+
+            colecao = "/".join(partes[:-1])
+            doc_id = partes[-1]
+            cur.execute(
+                "SELECT dados FROM registros_kv WHERE colecao = %s AND doc_id = %s",
+                (colecao, doc_id),
+            )
+            row = cur.fetchone()
+            if not row:
+                return {"exists": False, "data": None}
+            return {"exists": True, "data": row["dados"]}
+
+
+@app.post("/api/db/{caminho:path}")
+async def db_post(caminho: str, request: Request, session_token: Optional[str] = Cookie(default=None)):
+    user = exigir_usuario(session_token, exigir_escrita=True)
+    dados = await request.json()
+    colecao = caminho.strip("/")
+    doc_id = str(dados.get("id") or uuid.uuid4())
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            if colecao == "historico":
+                registrar_historico(
+                    cur,
+                    user["id"],
+                    str(dados.get("acao") or "REGISTRO"),
+                    str(dados.get("alvo") or ""),
+                    str(dados.get("detalhe") or ""),
+                )
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO registros_kv (colecao, doc_id, dados, atualizado_por, atualizado_em)
+                    VALUES (%s, %s, %s::jsonb, %s, NOW())
+                    ON CONFLICT (colecao, doc_id) DO UPDATE SET
+                        dados = EXCLUDED.dados,
+                        atualizado_por = EXCLUDED.atualizado_por,
+                        atualizado_em = NOW()
+                    """,
+                    (colecao, doc_id, json.dumps(dados, ensure_ascii=False), user["id"]),
+                )
+                espelhar_documento_relacional(cur, colecao, doc_id, dados, user["id"])
+        conn.commit()
+
+    await notificar_sse(colecao)
+    return {"ok": True, "id": doc_id}
+
+
+@app.put("/api/db/{caminho:path}")
+async def db_put(caminho: str, request: Request, session_token: Optional[str] = Cookie(default=None)):
+    user = exigir_usuario(session_token, exigir_escrita=True)
+    dados = await request.json()
+    partes = [p for p in caminho.split("/") if p]
+    colecao = "/".join(partes[:-1]) if len(partes) > 1 else partes[0]
+    doc_id = partes[-1] if len(partes) > 1 else str(uuid.uuid4())
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO registros_kv (colecao, doc_id, dados, atualizado_por, atualizado_em)
+                VALUES (%s, %s, %s::jsonb, %s, NOW())
+                ON CONFLICT (colecao, doc_id) DO UPDATE SET
+                    dados = EXCLUDED.dados,
+                    atualizado_por = EXCLUDED.atualizado_por,
+                    atualizado_em = NOW()
+                """,
+                (colecao, doc_id, json.dumps(dados, ensure_ascii=False), user["id"]),
+            )
+            espelhar_documento_relacional(cur, colecao, doc_id, dados, user["id"])
+        conn.commit()
+
+    await notificar_sse(colecao)
+    return {"ok": True, "id": doc_id}
+
+
+@app.patch("/api/db/{caminho:path}")
+async def db_patch(caminho: str, request: Request, session_token: Optional[str] = Cookie(default=None)):
+    user = exigir_usuario(session_token, exigir_escrita=True)
+    parcial = await request.json()
+    partes = [p for p in caminho.split("/") if p]
+    colecao = "/".join(partes[:-1]) if len(partes) > 1 else partes[0]
+    doc_id = partes[-1]
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT dados FROM registros_kv WHERE colecao = %s AND doc_id = %s",
+                (colecao, doc_id),
+            )
+            row = cur.fetchone()
+            atual = row["dados"] if row and isinstance(row["dados"], dict) else {}
+            atual.update(parcial)
+
+            cur.execute(
+                """
+                INSERT INTO registros_kv (colecao, doc_id, dados, atualizado_por, atualizado_em)
+                VALUES (%s, %s, %s::jsonb, %s, NOW())
+                ON CONFLICT (colecao, doc_id) DO UPDATE SET
+                    dados = EXCLUDED.dados,
+                    atualizado_por = EXCLUDED.atualizado_por,
+                    atualizado_em = NOW()
+                """,
+                (colecao, doc_id, json.dumps(atual, ensure_ascii=False), user["id"]),
+            )
+            espelhar_documento_relacional(cur, colecao, doc_id, atual, user["id"])
+        conn.commit()
+
+    await notificar_sse(colecao)
+    return {"ok": True}
+
+
+@app.delete("/api/db/{caminho:path}")
+async def db_delete(caminho: str, session_token: Optional[str] = Cookie(default=None)):
+    user = exigir_usuario(session_token, exigir_escrita=True)
+    partes = [p for p in caminho.split("/") if p]
+    colecao = "/".join(partes[:-1]) if len(partes) > 1 else partes[0]
+    doc_id = partes[-1]
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM registros_kv WHERE colecao = %s AND doc_id = %s",
+                (colecao, doc_id),
+            )
+            registrar_historico(cur, user["id"], "EXCLUIR_DOC", f"{colecao}/{doc_id}", "Documento excluído")
+        conn.commit()
+
+    await notificar_sse(colecao)
+    return {"ok": True}
+
+
+# ==============================================================================
+# EVENTOS EM TEMPO REAL (SSE - /api/eventos)
+# ==============================================================================
 @app.get("/api/eventos")
-async def canal_ao_vivo(request: Request):
-    exigir_usuario(request)
+async def sse_eventos(request: Request, session_token: Optional[str] = Cookie(default=None)):
+    exigir_usuario(session_token)
     fila: asyncio.Queue = asyncio.Queue()
-    telas_conectadas.append(fila)
+    FILAS_SSE.append(fila)
 
     async def gerador():
         try:
-            yield "data: {\"conectado\": true}\n\n"
             while True:
                 if await request.is_disconnected():
                     break
                 try:
-                    evento = await asyncio.wait_for(fila.get(), timeout=20.0)
-                    yield f"data: {evento}\n\n"
+                    msg = await asyncio.wait_for(fila.get(), timeout=20.0)
+                    yield f"data: {msg}\n\n"
                 except asyncio.TimeoutError:
-                    yield ": ping\n\n"
+                    yield ": keep-alive\n\n"
         finally:
-            if fila in telas_conectadas:
-                telas_conectadas.remove(fila)
+            if fila in FILAS_SSE:
+                FILAS_SSE.remove(fila)
 
     return StreamingResponse(gerador(), media_type="text/event-stream")
 
 
-@app.get("/api/db/historico")
-def listar_historico(request: Request, limit: int = 300):
-    exigir_usuario(request)
-    conn = abrir_conexao()
-    rows = conn.execute(
-        "SELECT em, por, acao, alvo, detalhe FROM historico ORDER BY em DESC LIMIT ?",
-        (limit,),
-    ).fetchall()
-    conn.close()
-    return {"docs": [dict(r) for r in rows]}
-
-
-@app.post("/api/db/historico")
-async def registrar_historico(request: Request):
-    u = exigir_usuario(request)
-    d = await request.json()
-    conn = abrir_conexao()
-    conn.execute(
-        "INSERT INTO historico (em, por, acao, alvo, detalhe) VALUES (?, ?, ?, ?, ?)",
-        (
-            d.get("em") or agora_iso(),
-            d.get("por") or u["id"],
-            d.get("acao", ""),
-            d.get("alvo", ""),
-            d.get("detalhe", ""),
-        ),
-    )
-    conn.commit()
-    conn.close()
-    return {"ok": True}
-
-
-@app.get("/api/db/{colecao}")
-def listar_colecao(colecao: str, request: Request):
-    exigir_usuario(request)
-    conn = abrir_conexao()
-    rows = conn.execute(
-        "SELECT doc_id, dados FROM registros WHERE colecao = ?", (colecao,)
-    ).fetchall()
-    conn.close()
-    return {
-        "docs": [{"id": r["doc_id"], "data": json.loads(r["dados"])} for r in rows]
-    }
-
-
-@app.get("/api/db/{colecao}/{doc_id}")
-def ler_documento(colecao: str, doc_id: str, request: Request):
-    exigir_usuario(request)
-    conn = abrir_conexao()
-    row = conn.execute(
-        "SELECT dados FROM registros WHERE colecao = ? AND doc_id = ?",
-        (colecao, doc_id),
-    ).fetchone()
-    conn.close()
-    if not row:
-        return {"exists": False, "id": doc_id, "data": None}
-    return {"exists": True, "id": doc_id, "data": json.loads(row["dados"])}
-
-
-@app.put("/api/db/{colecao}/{doc_id}")
-async def salvar_documento(colecao: str, doc_id: str, request: Request):
-    u = exigir_usuario(request)
-    if not u["pode_escrever"]:
-        raise HTTPException(status_code=403, detail="Usuário em modo somente leitura.")
-    dados = await request.json()
-    conn = abrir_conexao()
-    conn.execute(
-        """
-        INSERT INTO registros (colecao, doc_id, dados, atualizado_em)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(colecao, doc_id) DO UPDATE SET
-            dados = excluded.dados,
-            atualizado_em = excluded.atualizado_em
-        """,
-        (colecao, doc_id, json.dumps(dados, ensure_ascii=False), agora_iso()),
-    )
-    conn.commit()
-    conn.close()
-    await avisar_telas(colecao)
-    return {"ok": True}
-
-
-@app.patch("/api/db/{colecao}/{doc_id}")
-async def atualizar_documento(colecao: str, doc_id: str, request: Request):
-    u = exigir_usuario(request)
-    if not u["pode_escrever"]:
-        raise HTTPException(status_code=403, detail="Usuário em modo somente leitura.")
-    novos_campos: Dict[str, Any] = await request.json()
-    conn = abrir_conexao()
-    row = conn.execute(
-        "SELECT dados FROM registros WHERE colecao = ? AND doc_id = ?",
-        (colecao, doc_id),
-    ).fetchone()
-    atual = json.loads(row["dados"]) if row else {}
-    atual.update(novos_campos)
-    conn.execute(
-        """
-        INSERT INTO registros (colecao, doc_id, dados, atualizado_em)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(colecao, doc_id) DO UPDATE SET
-            dados = excluded.dados,
-            atualizado_em = excluded.atualizado_em
-        """,
-        (colecao, doc_id, json.dumps(atual, ensure_ascii=False), agora_iso()),
-    )
-    conn.commit()
-    conn.close()
-    await avisar_telas(colecao)
-    return {"ok": True}
-
-
-@app.delete("/api/db/{colecao}/{doc_id}")
-async def apagar_documento(colecao: str, doc_id: str, request: Request):
-    u = exigir_usuario(request)
-    if not u["pode_escrever"]:
-        raise HTTPException(status_code=403, detail="Usuário em modo somente leitura.")
-    conn = abrir_conexao()
-    conn.execute(
-        "DELETE FROM registros WHERE colecao = ? AND doc_id = ?", (colecao, doc_id)
-    )
-    conn.commit()
-    conn.close()
-    await avisar_telas(colecao)
-    return {"ok": True}
-
-
 # ==============================================================================
-# ROTAS DE FOTOS (PROTEGIDAS POR LOGIN)
+# FOTOS / ASSETS (/api/assets e /_blob)
 # ==============================================================================
-
 @app.post("/api/assets")
-async def enviar_foto(request: Request, file: UploadFile = File(...)):
-    u = exigir_usuario(request)
-    if not u["pode_escrever"]:
-        raise HTTPException(status_code=403, detail="Usuário em modo somente leitura.")
+async def upload_asset(file: UploadFile = File(...), session_token: Optional[str] = Cookie(default=None)):
+    user = exigir_usuario(session_token, exigir_escrita=True)
     conteudo = await file.read()
-    asset_id = uuid.uuid4().hex
-    nome_arquivo = f"{asset_id}.jpg"
-    caminho = PASTA_FOTOS / nome_arquivo
-    caminho.write_bytes(conteudo)
+    asset_id = str(uuid.uuid4())
+    ext = Path(file.filename or "foto.jpg").suffix.lower() or ".jpg"
+    if ext not in {".jpg", ".jpeg", ".png", ".webp"}:
+        ext = ".jpg"
 
-    conn = abrir_conexao()
-    conn.execute(
-        "INSERT INTO arquivos (id, nome_arquivo, mime_type, size_bytes, criado_em) VALUES (?, ?, ?, ?, ?)",
-        (asset_id, nome_arquivo, file.content_type or "image/jpeg", len(conteudo), agora_iso()),
-    )
-    conn.commit()
-    conn.close()
-    return {"id": asset_id, "sizeBytes": len(conteudo)}
+    nome_arquivo = f"{asset_id}{ext}"
+    (PASTA_FOTOS / nome_arquivo).write_bytes(conteudo)
 
-
-@app.delete("/api/assets/{asset_id}")
-def apagar_foto(asset_id: str, request: Request):
-    u = exigir_usuario(request)
-    if not u["pode_escrever"]:
-        raise HTTPException(status_code=403, detail="Usuário em modo somente leitura.")
-    conn = abrir_conexao()
-    row = conn.execute(
-        "SELECT nome_arquivo FROM arquivos WHERE id = ?", (asset_id,)
-    ).fetchone()
-    if row:
-        caminho = PASTA_FOTOS / row["nome_arquivo"]
-        if caminho.exists():
-            caminho.unlink()
-        conn.execute("DELETE FROM arquivos WHERE id = ?", (asset_id,))
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            registrar_historico(cur, user["id"], "UPLOAD_FOTO", nome_arquivo, f"{len(conteudo)} bytes")
         conn.commit()
-    conn.close()
-    return {"ok": True}
+
+    return {"id": asset_id, "url": f"/_blob/{asset_id}"}
 
 
 @app.get("/api/assets/usage")
-def uso_armazenamento(request: Request):
-    exigir_usuario(request)
-    conn = abrir_conexao()
-    row = conn.execute(
-        "SELECT COUNT(*) AS qtd, COALESCE(SUM(size_bytes), 0) AS bytes FROM arquivos"
-    ).fetchone()
-    conn.close()
+def assets_usage(session_token: Optional[str] = Cookie(default=None)):
+    exigir_usuario(session_token)
+    arquivos = [p for p in PASTA_FOTOS.glob("*") if p.is_file()]
+    total_bytes = sum(p.stat().st_size for p in arquivos)
     return {
-        "usage": {
-            "bytes": row["bytes"],
-            "maxBytes": 1073741824,
-            "files": row["qtd"],
-            "maxFiles": 10000,
-        }
+        "count": len(arquivos),
+        "bytes": total_bytes,
+        "items": [{"id": p.stem, "url": f"/_blob/{p.stem}", "bytes": p.stat().st_size} for p in arquivos],
     }
 
 
+@app.get("/api/assets/{asset_id}")
 @app.get("/_blob/{asset_id}")
-def abrir_foto(asset_id: str, request: Request):
-    exigir_usuario(request)
-    conn = abrir_conexao()
-    row = conn.execute(
-        "SELECT nome_arquivo, mime_type FROM arquivos WHERE id = ?", (asset_id,)
-    ).fetchone()
-    conn.close()
-    nome = row["nome_arquivo"] if row else f"{asset_id}.jpg"
-    mime = row["mime_type"] if row else "image/jpeg"
-    caminho = PASTA_FOTOS / nome
-    if not caminho.exists():
-        raise HTTPException(status_code=404, detail="Foto não encontrada")
-    return FileResponse(caminho, media_type=mime)
+def get_asset(asset_id: str):
+    for candidato in PASTA_FOTOS.glob(f"{asset_id}.*"):
+        return FileResponse(candidato)
+    raise HTTPException(status_code=404, detail="Imagem não encontrada.")
+
+
+@app.delete("/api/assets/{asset_id}")
+def delete_asset(asset_id: str, session_token: Optional[str] = Cookie(default=None)):
+    user = exigir_usuario(session_token, exigir_escrita=True)
+    for candidato in PASTA_FOTOS.glob(f"{asset_id}.*"):
+        candidato.unlink(missing_ok=True)
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            try:
+                cur.execute("DELETE FROM fotos WHERE id = %s::uuid", (asset_id,))
+            except Exception:
+                pass
+            registrar_historico(cur, user["id"], "EXCLUIR_FOTO", asset_id, "Foto removida")
+        conn.commit()
+    return {"ok": True}
 
 
 # ==============================================================================
-# ENTREGA DAS PÁGINAS (CONTROLADA PELO LOGIN)
+# PROTEÇÃO DE PÁGINAS E ARQUIVOS ESTÁTICOS (SEM CACHE NA ROTA RAIZ)
 # ==============================================================================
-
 @app.get("/")
-def abrir_sistema(request: Request):
-    u = obter_usuario_sessao(request)
-    if not u:
-        return FileResponse(
-            PASTA_FRONTEND / "login.html",
-            headers={"Cache-Control": "no-store"},
-        )
+def raiz(session_token: Optional[str] = Cookie(default=None)):
+    user = obter_usuario_sessao(session_token)
+    arquivo = PASTA_FRONTEND / ("index.html" if user else "login.html")
     return FileResponse(
-        PASTA_FRONTEND / "index.html",
-        headers={"Cache-Control": "no-store"},
+        arquivo,
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
     )
 
 
 @app.get("/usuarios.html")
-def abrir_gerenciador_usuarios(request: Request):
-    u = obter_usuario_sessao(request)
-    if not u or not u["is_owner"]:
-        return RedirectResponse(url="/", status_code=302)
+def pagina_usuarios(session_token: Optional[str] = Cookie(default=None)):
+    user = obter_usuario_sessao(session_token)
+    if not user:
+        return FileResponse(
+            PASTA_FRONTEND / "login.html",
+            headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"},
+        )
+    if not user["isOwner"]:
+        raise HTTPException(status_code=403, detail="Acesso restrito à Coordenação.")
     return FileResponse(
         PASTA_FRONTEND / "usuarios.html",
-        headers={"Cache-Control": "no-store"},
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"},
     )
 
 
-app.mount("/", StaticFiles(directory=PASTA_FRONTEND), name="frontend")
+app.mount("/", StaticFiles(directory=str(PASTA_FRONTEND)), name="frontend")
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run("servidor:app", host="0.0.0.0", port=8000, reload=True)
