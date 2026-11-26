@@ -1,0 +1,27 @@
+# Ambiente virtual
+venv/
+.venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Banco de dados local
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Arquivos enviados pelos usuários
+storage/
+
+# Variáveis de ambiente / segredos
+.env
+.env.*
+
+# Editores e sistema
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
